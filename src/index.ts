@@ -110,6 +110,12 @@ const STATE = {
   lastHighlightQId: "",
   retryCount: 0,
   maxRetries: 10,
+  /** Mode join kode — Quiz API mungkin diblokir */
+  joinMode: false,
+  /** Jawaban dari network intercept */
+  networkAnswers: new Map<string, any>(),
+  /** Jawaban sudah pernah ditampilkan untuk question ini */
+  shownForQuestion: new Set<string>(),
 };
 
 // ═══════════════════════════════════════════
@@ -133,7 +139,7 @@ const Pinia = {
     const root = document.querySelector("#root") || document.querySelector("#app");
     if (!root) return null;
     const app = (root as any).__vue_app__;
-    if (!app) return null;
+       if (!app) return null;
     return app.config.globalProperties?.$pinia || null;
   },
 
@@ -146,12 +152,22 @@ const Pinia = {
     return this.store(name)?.$state || null;
   },
 
+  /** quizId — bisa dari gameData (latihan) ATAU preGameDetail (join kode) */
   get quizId(): string | null {
-    return this.state("gameData")?.quizId || null;
+    // Mode latihan: gameData.quizId langsung ada
+    const gdQuizId = this.state("gameData")?.quizId;
+    if (gdQuizId) return gdQuizId;
+    // Mode join kode: quizId ada di preGameDetail
+    const pgd = this.state("preGameDetail");
+    if (pgd?.currentQuizData?.quizId) return pgd.currentQuizData.quizId;
+    // Fallback: cek currentGameData
+    if (pgd?.currentGameData?.quizId) return pgd.currentGameData.quizId;
+    return null;
   },
 
   get roomHash(): string | null {
-    return this.state("gameData")?.roomHash || null;
+    const gd = this.state("gameData");
+    return gd?.roomHash || gd?.gameId || null;
   },
 
   get currentQId(): string | null {
@@ -159,9 +175,27 @@ const Pinia = {
     return gq?.currentId || gq?.currentQuestionId || null;
   },
 
+  /** Deteksi apakah user sudah di dalam game (latihan ATAU join kode) */
   get inGame(): boolean {
     const gd = this.state("gameData");
-    return !!(gd?.roomHash && gd?.gameState);
+    // Mode latihan: gameState ada langsung
+    if (gd?.roomHash && gd?.gameState) return true;
+    // Mode join kode: roomHash ada tapi gameState mungkin masih kosong
+    // Cek dari routing atau preGameDetail
+    if (gd?.roomHash) return true;
+    // Fallback: cek preGameDetail
+    const pgd = this.state("preGameDetail");
+    if (pgd?.currentGameData?.gameState) return true;
+    return false;
+  },
+
+  /** Cek apakah game sudah berjalan (pertanyaan aktif) */
+  get gameRunning(): boolean {
+    const gd = this.state("gameData");
+    if (gd?.gameState === "running") return true;
+    const gq = this.state("gameQuestions");
+    if (gq?.currentId || gq?.currentQuestionId) return true;
+    return false;
   },
 
   get questionList(): Record<string, any> {
@@ -205,11 +239,55 @@ const API = {
     return qs;
   },
 
+  /** Endpoint quiz-info — dari analisis join kode */
+  async fetchQuizInfo(roomHash: string): Promise<{ quizId: string } | null> {
+    LOG.info(`Fetching quiz-info API: ${roomHash}`);
+    try {
+      const gd = Pinia.state("gameData");
+      const gameState = gd?.gameState || "running";
+      const gameType = gd?.gameType || "async";
+      const r = await fetch(`/_gameapi/main/public/v1/games/${roomHash}/quiz-info?gameState=${gameState}&gameType=${gameType}`);
+      if (!r.ok) return null;
+      const d = await r.json();
+      return d?.data || null;
+    } catch {
+      return null;
+    }
+  },
+
+  /** Endpoint students game — dari analisis join kode */
+  async fetchStudentGame(roomHash: string): Promise<ApiQuestion[]> {
+    LOG.info(`Fetching Student Game API: ${roomHash}`);
+    try {
+      const r = await fetch(`/_gameapi/main/public/v1/students/games/${roomHash}`);
+      if (!r.ok) throw new Error(`Student Game API: HTTP ${r.status}`);
+      const d = await r.json();
+      const qs = d?.data?.quiz?.info?.questions || d?.data?.questions;
+      if (!Array.isArray(qs)) throw new Error("Student Game API: no questions");
+      return qs;
+    } catch (e: any) {
+      LOG.warn(`Student Game API failed: ${e.message}`);
+      return [];
+    }
+  },
+
   async loadAnswers(): Promise<boolean> {
     let questions: ApiQuestion[] = [];
-    const { quizId, roomHash } = { quizId: Pinia.quizId, roomHash: Pinia.roomHash };
+    let quizId = Pinia.quizId;
+    const roomHash = Pinia.roomHash;
 
-    // Primary: Quiz API
+    LOG.info(`Load answers — quizId: ${quizId || "kosong"}, roomHash: ${roomHash || "kosong"}`);
+
+    // Jika quizId belum ada, coba ambil dari quiz-info API
+    if (!quizId && roomHash) {
+      const info = await this.fetchQuizInfo(roomHash);
+      if (info?.quizId) {
+        quizId = info.quizId;
+        LOG.success(`quizId dari quiz-info API: ${quizId}`);
+      }
+    }
+
+    // Primary: Quiz API (paling reliable — selalu punya jawaban)
     if (quizId) {
       try {
         questions = await this.fetchQuiz(quizId);
@@ -219,7 +297,19 @@ const API = {
       }
     }
 
-    // Fallback: Game API
+    // Fallback 1: Student Game API
+    if (questions.length === 0 && roomHash) {
+      try {
+        questions = await this.fetchStudentGame(roomHash);
+        if (questions.length > 0) {
+          LOG.success(`Student Game API: ${questions.length} questions loaded`);
+        }
+      } catch (e: any) {
+        LOG.warn(`Student Game API failed: ${e.message}`);
+      }
+    }
+
+    // Fallback 2: Game API
     if (questions.length === 0 && roomHash) {
       try {
         questions = await this.fetchGame(roomHash);
@@ -230,7 +320,7 @@ const API = {
     }
 
     if (questions.length === 0) {
-      LOG.error("All API sources failed!");
+      LOG.error("Semua API gagal!");
       return false;
     }
 
@@ -248,7 +338,7 @@ const API = {
     STATE.answers.forEach((a) => {
       if (a.indices.length > 0 || a.blankTexts.length > 0 || a.imageUrls.length > 0) valid++;
     });
-    LOG.success(`Answer quality: ${valid}/${STATE.totalQ} questions have valid answers`);
+    LOG.success(`Kualitas jawaban: ${valid}/${STATE.totalQ} pertanyaan punya jawaban valid`);
 
     return true;
   },
@@ -422,30 +512,136 @@ const DOM = {
 };
 
 // ═══════════════════════════════════════════
+//  NETWORK INTERCEPTOR — Tangkap jawaban dari server
+//  Untuk mode join kode dimana Quiz API diblokir
+// ═══════════════════════════════════════════
+
+const NetInterceptor = {
+  installed: false,
+
+  install(): void {
+    if (this.installed) return;
+    this.installed = true;
+
+    // Intercept fetch
+    const origFetch = window.fetch;
+    window.fetch = async function (input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+      const response = await origFetch.call(this, input, init);
+
+      try {
+        const url = typeof input === "string" ? input : (input instanceof Request ? input.url : String(input));
+        const method = init?.method || "GET";
+
+        // Intercept proceed API — jawaban benar ada di response
+        if (url.includes("/proceed") || url.includes("/proceedGameApi")) {
+          const clone = response.clone();
+          clone.json().then((data: any) => {
+            NetInterceptor.handleProceedResponse(data);
+          }).catch(() => {});
+        }
+
+        // Intercept question-related responses
+        if (url.includes("/game") && method === "GET") {
+          const clone = response.clone();
+          clone.json().then((data: any) => {
+            NetInterceptor.handleGameResponse(data);
+          }).catch(() => {});
+        }
+      } catch {}
+
+      return response;
+    };
+
+    LOG.info("Network interceptor terpasang");
+  },
+
+  /** Handle proceed response — ini punya jawaban benar */
+  handleProceedResponse(data: any): void {
+    if (!data?.data) return;
+
+    const d = data.data;
+
+    // Jawaban benar sering ada di response proceed
+    const questionId = d.questionId || d.question?.id;
+    const correctAnswer = d.correctAnswer ?? d.answer ?? d.question?.answer;
+
+    if (questionId && correctAnswer !== undefined && correctAnswer !== -1) {
+      LOG.success(`Network intercept: Q=${questionId}, answer=${JSON.stringify(correctAnswer)}`);
+      STATE.networkAnswers.set(questionId, correctAnswer);
+
+      // Jika pertanyaan ini sedang aktif, update display
+      if (questionId === STATE.currentQId) {
+        Engine.processNetworkAnswer(questionId, correctAnswer, d);
+      }
+    }
+  },
+
+  /** Handle game response — mungkin punya data pertanyaan */
+  handleGameResponse(data: any): void {
+    if (!data?.data) return;
+
+    const questions = data.data.questions || data.data.quiz?.info?.questions;
+    if (Array.isArray(questions) && questions.length > 0) {
+      questions.forEach((q: any) => {
+        if (q._id && q.structure?.answer !== undefined && q.structure?.answer !== -1) {
+          STATE.networkAnswers.set(q._id, q.structure.answer);
+        }
+      });
+      if (STATE.networkAnswers.size > 0) {
+        LOG.success(`Network intercept: ${STATE.networkAnswers.size} answers dari game response`);
+      }
+    }
+  },
+};
+
+// ═══════════════════════════════════════════
 //  ENGINE — CORE LOGIC
 // ═══════════════════════════════════════════
 
 const Engine = {
   /** Process current question — highlight correct answer */
   processQuestion(qId: string): boolean {
-    if (!STATE.loaded) return false;
-
-    const answer = STATE.answers.get(qId);
-    if (!answer) {
-      LOG.warn(`Question ${qId} not in answer map`);
-      return false;
+    // Cek dulu dari pre-loaded answers (mode latihan)
+    if (STATE.loaded) {
+      const answer = STATE.answers.get(qId);
+      if (answer) {
+        return this.processFromPreloaded(qId, answer);
+      }
     }
 
-    DOM.clearHighlights();
-    // BUG FIX #1: Don't set lastHighlightQId here — set it AFTER successful highlight
-    // This was blocking retries when handleMCQ failed
+    // Cek dari network intercept
+    const netAnswer = STATE.networkAnswers.get(qId);
+    if (netAnswer !== undefined) {
+      return this.processNetworkAnswer(qId, netAnswer, null);
+    }
 
-    // Get question text from store
+    // Cek dari Pinia store (reveal state)
+    const piniaAnswer = this.getPiniaAnswer(qId);
+    if (piniaAnswer !== null && piniaAnswer !== -1) {
+      return this.processPiniaAnswer(qId, piniaAnswer);
+    }
+
+    // Belum ada jawaban — tampilkan di panel bahwa menunggu
+    if (!STATE.shownForQuestion.has(qId)) {
+      STATE.shownForQuestion.add(qId);
+      Panel.updateAnswer("Menunggu jawaban...");
+      const qList = Pinia.questionList;
+      const qObj = qList?.[qId];
+      const qText = qObj?.text ? stripHtml(qObj.text) : "";
+      Panel.updateQuestion(qText, qObj?.type || "?");
+    }
+
+    return false;
+  },
+
+  /** Process dari pre-loaded Quiz API answers (mode latihan) */
+  processFromPreloaded(qId: string, answer: ParsedAnswer): boolean {
+    DOM.clearHighlights();
+
     const qList = Pinia.questionList;
     const qObj = qList?.[qId];
     const qText = qObj?.text ? stripHtml(qObj.text) : "";
 
-    // BUG FIX #4: Show image option index if no text
     let answerDisplay = "—";
     if (answer.displayTexts.length > 0) {
       answerDisplay = answer.displayTexts.join(" / ");
@@ -455,11 +651,9 @@ const Engine = {
       answerDisplay = answer.blankTexts.join(" / ");
     }
 
-    // Update panel
     Panel.updateQuestion(qText, answer.type);
     Panel.updateAnswer(answerDisplay);
 
-    // Handle by type
     let success = false;
     if (answer.type === "BLANK" || answer.type === "OPEN") {
       success = this.handleBlank(answer);
@@ -467,11 +661,113 @@ const Engine = {
       success = this.handleMCQ(answer, qId);
     }
 
-    // BUG FIX #1: Only mark as processed AFTER success
     if (success) {
       STATE.lastHighlightQId = qId;
     }
     return success;
+  },
+
+  /** Process jawaban dari network intercept */
+  processNetworkAnswer(qId: string, answer: any, data: any): boolean {
+    LOG.info(`Processing network answer for ${qId}: ${JSON.stringify(answer)}`);
+
+    const qList = Pinia.questionList;
+    const qObj = qList?.[qId];
+    const qText = qObj?.text ? stripHtml(qObj.text) : "";
+    const qType = qObj?.type || "MCQ";
+
+    // Convert network answer ke format yang bisa ditampilkan
+    const parsed = this.parseNetworkAnswer(answer, qType, qId);
+
+    Panel.updateQuestion(qText, qType);
+    Panel.updateAnswer(parsed.displayText || `Opsi #${(typeof answer === "number" ? answer + 1 : answer)}`);
+
+    // Highlight di DOM
+    if (parsed.indices.length > 0) {
+      DOM.clearHighlights();
+      const allOptions = DOM.getOptions();
+      const correctEls: HTMLElement[] = [];
+
+      for (const idx of parsed.indices) {
+        const el = DOM.getOptionByIndex(idx);
+        if (el) correctEls.push(el);
+      }
+
+      if (correctEls.length > 0) {
+        const correctSet = new Set(correctEls);
+        allOptions.forEach((el) => {
+          if (correctSet.has(el)) {
+            DOM.highlightCorrect(el);
+          } else if (STATE.dimWrong) {
+            DOM.dimWrong(el);
+          }
+        });
+        STATE.lastHighlightQId = qId;
+        return true;
+      }
+    }
+
+    return true; // Tetap return true biar panel terupdate
+  },
+
+  /** Process jawaban dari Pinia store (reveal state) */
+  processPiniaAnswer(qId: string, answer: any): boolean {
+    LOG.info(`Processing Pinia answer for ${qId}: ${JSON.stringify(answer)}`);
+    return this.processNetworkAnswer(qId, answer, null);
+  },
+
+  /** Parse network/Pinia answer ke format yang bisa dipakai */
+  parseNetworkAnswer(answer: any, qType: string, qId: string): { indices: number[]; displayText: string } {
+    const result = { indices: [] as number[], displayText: "" };
+
+    if (typeof answer === "number" && answer >= 0) {
+      result.indices.push(answer);
+      // Coba ambil teks option dari Pinia
+      const qList = Pinia.questionList;
+      const qObj = qList?.[qId];
+      const options = qObj?.options || [];
+      if (answer < options.length) {
+        result.displayText = stripHtml(options[answer].text || options[answer] || "");
+      }
+      if (!result.displayText) {
+        result.displayText = `Opsi #${answer + 1}`;
+      }
+    } else if (Array.isArray(answer)) {
+      // MSQ atau BLANK
+      if (qType === "BLANK" || qType === "OPEN") {
+        result.displayText = answer.join(", ");
+      } else {
+        answer.forEach((idx: any) => {
+          if (typeof idx === "number" && idx >= 0) result.indices.push(idx);
+          else if (typeof idx === "string") {
+            // Mungkin option ID — cari index
+            const qList = Pinia.questionList;
+            const qObj = qList?.[qId];
+            const options = qObj?.options || [];
+            const optIdx = options.findIndex((o: any) => o.id === idx || o === idx);
+            if (optIdx >= 0) result.indices.push(optIdx);
+          }
+        });
+        if (result.displayText === "" && result.indices.length > 0) {
+          result.displayText = result.indices.map(i => `Opsi #${i + 1}`).join(", ");
+        }
+      }
+    }
+
+    return result;
+  },
+
+  /** Baca jawaban dari Pinia gameQuestions store */
+  getPiniaAnswer(qId: string): any {
+    const gq = Pinia.state("gameQuestions");
+    if (!gq?.list) return null;
+    const q = gq.list[qId];
+    if (!q) return null;
+    // Jawaban hanya ada setelah reveal
+    const answer = q.answer;
+    if (answer === undefined || answer === null || answer === -1) return null;
+    if (Array.isArray(answer) && answer.length === 0) return null;
+    return answer;
   },
 
   /** Handle MCQ/MSQ question highlighting */
@@ -612,37 +908,25 @@ const Engine = {
 
   /** Check for question change and process */
   tick(): void {
-    if (!STATE.loaded) return;
-
     const qId = Pinia.currentQId;
-    if (!qId || qId === STATE.currentQId) return;
+    if (!qId) return;
 
-    STATE.currentQId = qId;
-    // BUG FIX #3: Count from Pinia state instead of incrementing
-    const gq = Pinia.state("gameQuestions");
-    STATE.answeredQ = gq?.doneOrder?.length || 0;
+    // Pertanyaan baru terdeteksi
+    if (qId !== STATE.currentQId) {
+      STATE.currentQId = qId;
+      STATE.shownForQuestion.delete(qId);
+      const gq = Pinia.state("gameQuestions");
+      STATE.answeredQ = gq?.doneOrder?.length || 0;
+      LOG.info(`Pertanyaan baru: ${qId}`);
+      STATE.retryCount = 0;
+    }
 
-    LOG.info(`New question: ${qId}`);
-    STATE.retryCount = 0;
+    // Selalu coba process — mungkin jawaban baru muncul dari Pinia/network
+    const success = this.processQuestion(qId);
+    if (success) {
+      STATE.lastHighlightQId = qId;
+    }
 
-    // Try processing, with retry if DOM not ready
-    const tryProcess = () => {
-      if (STATE.retryCount >= STATE.maxRetries) {
-        LOG.warn(`Gave up after ${STATE.maxRetries} retries`);
-        return;
-      }
-
-      const success = this.processQuestion(qId);
-      if (!success) {
-        STATE.retryCount++;
-        LOG.info(`Retry ${STATE.retryCount}/${STATE.maxRetries} in 400ms`);
-        setTimeout(tryProcess, 400);
-      } else {
-        STATE.retryCount = 0;
-      }
-    };
-
-    tryProcess();
     Panel.updateStats();
   },
 
@@ -1044,36 +1328,58 @@ const Panel = {
 
 const Boot = {
   async start(): Promise<void> {
-    LOG.always("Starting WG v2.0...");
+    LOG.always("Starting WG v2.1...");
+
+    // Install network interceptor SECEPATNYA untuk tangkap semua request
+    NetInterceptor.install();
 
     Panel.create();
     Panel.updateStatus("Menunggu permainan...", "loading");
 
-    // Wait for game to start (up to 40s)
-    for (let i = 0; i < 40; i++) {
-      if (Pinia.inGame) break;
+    // Wait for game data to appear (roomHash) — bisa dari latihan atau join kode
+    for (let i = 0; i < 120; i++) {
+      if (Pinia.roomHash) break;
       await new Promise((r) => setTimeout(r, 1000));
-      Panel.updateStatus(`Menunggu permainan... (${i + 1}d)`, "loading");
+      if (i % 5 === 0) Panel.updateStatus(`Menunggu permainan... (${i + 1}d)`, "loading");
     }
 
-    if (!Pinia.inGame) {
+    if (!Pinia.roomHash) {
       Panel.updateStatus("Permainan tidak ditemukan — masuk ke permainan dulu!", "err");
       return;
     }
 
+    LOG.success(`roomHash ditemukan: ${Pinia.roomHash}`);
+
+    // Coba muat jawaban (quizId mungkin belum ada, akan dicoba lewat API)
     Panel.updateStatus("Memuat jawaban...", "loading");
 
-    const ok = await API.loadAnswers();
+    let ok = await API.loadAnswers();
+
+    // Jika gagal, tunggu quizId muncul di Pinia (join kode butuh waktu)
     if (!ok) {
-      Panel.updateStatus("Gagal memuat jawaban!", "err");
-      return;
+      for (let i = 0; i < 30; i++) {
+        await new Promise((r) => setTimeout(r, 2000));
+        Panel.updateStatus(`Menunggu data quiz... (${i + 1}d)`, "loading");
+        ok = await API.loadAnswers();
+        if (ok) break;
+      }
     }
 
-    Panel.updateStatus(`${STATE.totalQ} pertanyaan dimuat`, "ok");
-    Panel.updateStats();
+    if (!ok) {
+      Panel.updateStatus("Gagal memuat jawaban! Coba klik ↻", "err");
+      // Jangan return — tetap polling, mungkin quizId muncul nanti
+    } else {
+      Panel.updateStatus(`${STATE.totalQ} pertanyaan dimuat`, "ok");
+      Panel.updateStats();
+    }
 
-    // Start polling
+    // Start polling untuk deteksi pertanyaan
     Engine.startPolling();
+
+    // Juga poll untuk reload answers kalau belum berhasil
+    if (!STATE.loaded) {
+      this.backgroundLoad();
+    }
 
     // Process current question immediately
     const qId = Pinia.currentQId;
@@ -1082,7 +1388,28 @@ const Boot = {
       Engine.processQuestion(qId);
     }
 
-    LOG.success("WG v2.0 ready!");
+    LOG.success("WG v2.1 ready!");
+  },
+
+  /** Background load — terus coba muat jawaban sampai berhasil */
+  async backgroundLoad(): Promise<void> {
+    for (let i = 0; i < 60; i++) {
+      if (STATE.loaded) return;
+      await new Promise((r) => setTimeout(r, 3000));
+      const ok = await API.loadAnswers();
+      if (ok) {
+        Panel.updateStatus(`${STATE.totalQ} pertanyaan dimuat`, "ok");
+        Panel.updateStats();
+        // Process current question jika ada
+        const qId = Pinia.currentQId;
+        if (qId) {
+          STATE.currentQId = qId;
+          Engine.processQuestion(qId);
+        }
+        return;
+      }
+    }
+    Panel.updateStatus("Gagal memuat jawaban!", "err");
   },
 
   stop(): void {
