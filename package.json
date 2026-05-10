@@ -1,0 +1,22 @@
+{
+  "name": "wg",
+  "version": "2.0.0",
+  "description": "WG v2 - Wayground Game Helper | VVIP UI, bulletproof answer detection",
+  "main": "src/index.ts",
+  "private": true,
+  "scripts": {
+    "build": "webpack"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Danz-Pro/WG.git"
+  },
+  "author": "Danz-Pro",
+  "license": "MIT",
+  "devDependencies": {
+    "ts-loader": "^8.0.12",
+    "typescript": "^4.1.3",
+    "webpack": "^5.10.3",
+    "webpack-cli": "^4.2.0"
+  }
+}
